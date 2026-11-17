@@ -3,7 +3,7 @@
 //          Vc node -> Cx -> GND
 // Press BOOT (GPIO0) once -> measure once, print over Serial 9600, LED (GPIO2) on 200 ms.
 
-const int PIN_CHARGE = 25, PIN_ADC = 34, PIN_BTN = 0, PIN_LED = 2;
+const int PIN_CHARGE = 25, PIN_ADC = 34, PIN_BTN = 27, PIN_LED = 2;
 
 // ---- Calibration (measured on our board) ----
 const float R1 = 1.043e6;       // R1 measured with Fluke 117 (out of circuit)
