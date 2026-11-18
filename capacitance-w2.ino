@@ -7,15 +7,21 @@
 //
 // How it works: set GPIO25 HIGH, read the ADC continuously, and record the time t
 // when Vc reaches 63.2% of Vcc. At that point t = tau = R1 * Cx, so Cx = t / R1.
+// Small C: the first ADC sample is already past 63.2%, so tau is computed from that
+// single sample: tau = -t / ln(1 - Vc/Vcc). The two paths have separate calibration.
 // Timing uses the CPU cycle counter (~4 ns resolution at 240 MHz).
 
 const int PIN_CHARGE = 25, PIN_ADC = 34, PIN_BTN = 27, PIN_LED = 2;
 
-// ---- Calibration (2-point, see steps) ----
+// ---- Calibration ----
 const float R1 = 1.043e6;       // R1 measured with Fluke 117 (out of circuit)
 const float VCC_MV = 3268;      // 3V3 rail measured with Fluke 117
-const float C_OFFSET_PF = 0;    // from the 20 pF capacitor
-const float GAIN = 1.0;         // from the 0.1 uF capacitor
+// single-sample path (small C), fitted from 5, 10, 15 pF
+const float GAIN_SINGLE = 1.420;
+const float OFFSET_SINGLE_PF = 9.41;
+// threshold-crossing path (larger C), from 20 pF
+const float GAIN_CROSS = 1.000;
+const float OFFSET_CROSS_PF = 6.54;
 
 // ---- Measurement settings ----
 const float VTH_FRAC = 0.632;               // threshold = 63.2% of Vcc
@@ -29,15 +35,14 @@ void discharge(float tau) {
   delay((uint32_t)(7.0 * tau * 1000.0) + 2);      // wait 7 tau
 }
 
-/// One charge cycle. Returns the time (s) to reach the threshold, or -1 on timeout.
-// If the first ADC sample is already above the threshold (small C), tau is computed
-// from that single sample instead: tau = -t / ln(1 - Vc/Vcc).
-// *firstSample is set true only if even that sample is too high to use (> 95%).
-float timeToThreshold(bool *firstSample) {
+// One charge cycle. Returns the time (s) to reach the threshold, or -1 on timeout.
+// *tooHigh = true if even the first sample is above 95% (too small to measure).
+// *single  = true if the single-sample path was used.
+float timeToThreshold(bool *tooHigh, bool *single) {
   const float vth = VCC_MV * VTH_FRAC;
   const float k = -log(1.0 - VTH_FRAC);            // = 1.0 for 63.2%
   const uint32_t timeoutCycles = (uint32_t)(TIMEOUT_S * cyclesPerSec);
-  *firstSample = false;
+  *tooHigh = false; *single = false;
   analogReadMilliVolts(PIN_ADC);                   // dummy read: wake up the ADC first
   digitalWrite(PIN_CHARGE, HIGH);
   uint32_t c0 = ESP.getCycleCount();
@@ -51,9 +56,10 @@ float timeToThreshold(bool *firstSample) {
     if (v >= vth) {
       digitalWrite(PIN_CHARGE, LOW);
       if (first) {                                 // small C: use this single sample
-        if (v >= VCC_MV * 0.95) { *firstSample = true; return 0; }
+        if (v >= VCC_MV * 0.95) { *tooHigh = true; return 0; }
+        *single = true;
         float tau = -t / log(1.0 - v / VCC_MV);
-        return tau * k;                            // same unit as time-to-threshold
+        return tau * k;
       }
       return tPrev + (vth - vPrev) * (t - tPrev) / (v - vPrev);  // linear interpolation
     }
@@ -62,31 +68,38 @@ float timeToThreshold(bool *firstSample) {
   }
 }
 
+// Convert one run's time to calibrated pF, using the calibration of the path it took.
+float toPF(float t, bool single) {
+  const float k = -log(1.0 - VTH_FRAC);
+  float c = t / (R1 * k) * 1e12;
+  return single ? (c - OFFSET_SINGLE_PF) * GAIN_SINGLE
+                : (c - OFFSET_CROSS_PF) * GAIN_CROSS;
+}
+
 float measurePF() {
-  bool firstSample = true;
+  bool tooHigh = true, single = false;
   float t = -1;
-  for (int tries = 0; tries < 5; tries++) {        // retry if the first ADC sample was too late
+  for (int tries = 0; tries < 5; tries++) {        // first run: estimate tau
     discharge(lastTau);
-    t = timeToThreshold(&firstSample);
-    if (t < 0 || !firstSample) break;
+    t = timeToThreshold(&tooHigh, &single);
+    if (t < 0 || !tooHigh) break;
     lastTau = 0;
   }
   if (t < 0) { lastTau = 1.0; return NAN; }        // too large (timeout)
-  if (firstSample) { lastTau = 0; return NAN; }    // too small (failed 5 times)
+  if (tooHigh) { lastTau = 0; return NAN; }        // too small
 
-  const float k = -log(1.0 - VTH_FRAC);            // = 1.0 for 63.2%
+  const float k = -log(1.0 - VTH_FRAC);
   float tau = t / k;
   int n = constrain((int)(2.0 / (8.0 * tau)), 3, 200); // small C: up to 200 runs
   float sum = 0; int ok = 0;
   for (int i = 0; i < n; i++) {
     discharge(tau);
-    float ti = timeToThreshold(&firstSample);
-    if (ti > 0 && !firstSample) { sum += ti; ok++; }
+    float ti = timeToThreshold(&tooHigh, &single);
+    if (ti > 0 && !tooHigh) { sum += toPF(ti, single); ok++; }
   }
   lastTau = tau;
   if (!ok) return NAN;
-  float c = (sum / ok) / (R1 * k) * 1e12;          // Cx = t / R1  (pF)
-  return (c - C_OFFSET_PF) * GAIN;
+  return sum / ok;
 }
 
 uint32_t ledOffAt = 0; bool lastBtn = HIGH; uint32_t lastChange = 0;
@@ -105,9 +118,9 @@ void loop() {
   if (b != lastBtn && millis() - lastChange > 50) {   // software debounce 50 ms
     lastChange = millis(); lastBtn = b;
     if (b == LOW) {                                    // one press = one measurement
-       float pf = measurePF();
-      if (isnan(pf)) Serial.print("\"TGR-48\"\r\nCapacitance = out of range\r\n");
-      else Serial.printf("\"TGR-48\"\r\nCapacitance = %.1f pF\r\n", pf);
+      float pf = measurePF();
+      if (isnan(pf)) Serial.print("\"TGR-48\"\r\nCapacitance = out of range\r\n\r\n");
+      else Serial.printf("\"TGR-48\"\r\nCapacitance = %.1f pF\r\n\r\n", pf);
       digitalWrite(PIN_LED, HIGH); ledOffAt = millis() + 200;
     }
   }
