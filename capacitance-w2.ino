@@ -105,9 +105,9 @@ void loop() {
   if (b != lastBtn && millis() - lastChange > 50) {   // software debounce 50 ms
     lastChange = millis(); lastBtn = b;
     if (b == LOW) {                                    // one press = one measurement
-      float pf = measurePF();
-      if (isnan(pf)) Serial.println("\"TGR-48\"\nCapacitance = out of range");
-      else Serial.printf("\"TGR-48\"\nCapacitance = %.1f pF\n", pf);
+       float pf = measurePF();
+      if (isnan(pf)) Serial.print("\"TGR-48\"\r\nCapacitance = out of range\r\n");
+      else Serial.printf("\"TGR-48\"\r\nCapacitance = %.1f pF\r\n", pf);
       digitalWrite(PIN_LED, HIGH); ledOffAt = millis() + 200;
     }
   }
